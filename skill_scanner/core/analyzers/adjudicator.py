@@ -278,6 +278,13 @@ class Adjudicator:
         # policy level costs nothing on skills with no HIGH+ findings.
         self._rule_registry: Any = None
 
+        # Lazy-loaded provider config, for the same reason. ``False`` marks a
+        # resolution failure so it is attempted once, not per finding.
+        self._provider_config: Any = None
+
+        # Latch so a broken LLM path is reported once per scan, not per finding.
+        self._llm_failure_reported = False
+
         # Audit records for every finding we considered (kept, skipped,
         # or demoted). Callers can attach these to scan_metadata for
         # traceability.
@@ -325,6 +332,109 @@ class Adjudicator:
             "severity": rule.default_severity or "",
         }
 
+    def _note_llm_failure(self, detail: object) -> None:
+        """Report the first failure to obtain a verdict at WARNING, once.
+
+        Every adjudication failure is individually harmless -- the finding keeps
+        its original severity and the gate only gets stricter -- which is exactly
+        why a wholly broken adjudicator is invisible. It leaves no trace outside
+        DEBUG logs while still appearing in ``analyzers_used``, so a
+        misconfiguration reads as "found no false positives" rather than "never
+        ran". One WARNING per scan is enough to tell those apart; the remaining
+        failures stay at DEBUG so a flaky provider cannot flood the log.
+        """
+        if self._llm_failure_reported:
+            return
+        self._llm_failure_reported = True
+        logger.warning(
+            "Adjudication is not producing verdicts (%s). Findings keep their original "
+            "severity, so the scan verdict is unaffected -- but no false positive will be "
+            "demoted while this persists. Check the model id and credentials "
+            "(SKILL_SCANNER_LLM_MODEL / SKILL_SCANNER_ADJUDICATOR_LLM_MODEL, "
+            "SKILL_SCANNER_LLM_API_KEY, SKILL_SCANNER_LLM_BASE_URL). "
+            "Later failures in this scan are logged at DEBUG.",
+            detail,
+        )
+
+    def _provider_params(self) -> dict[str, Any]:
+        """Resolve provider credentials and routing for the outbound request.
+
+        Delegates to :class:`ProviderConfig` -- the same resolver
+        ``LLMRequestHandler`` uses -- so the adjudicator picks up every
+        provider mechanism it already implements (Azure Entra ID tokens,
+        Bedrock bearer/IAM, Vertex ADC, the Gemini ``GEMINI_API_KEY`` handoff)
+        rather than re-deriving any of it here.
+
+        ``base_url`` and ``api_version`` are read here and passed IN, because
+        ``ProviderConfig`` takes them as constructor arguments and never reads
+        the environment for them -- ``analyzer_factory`` and ``meta_analyzer``
+        do that for their own call sites. Omitting them would be worse than
+        sending nothing: an OpenAI-compatible gateway config would ship the
+        gateway's ``api_key`` and the scanned file body to the provider's public
+        endpoint instead of the configured gateway. The two-tier lookup mirrors
+        ``meta_analyzer``, since ``SKILL_SCANNER_ADJUDICATOR_LLM_MODEL`` already
+        lets the adjudicator run a different model, which may need a different
+        endpoint.
+
+        The config is built once and cached. A resolver failure must not be
+        louder than the credential it is trying to supply, so any exception
+        degrades to an empty dict: the request then goes out exactly as it did
+        before this method existed, and the caller's existing error path keeps
+        the finding at its original severity.
+
+        Side effect, inherited from the shared resolver: for Google AI Studio
+        models ``get_request_params`` sets ``GEMINI_API_KEY`` in the process
+        environment when it is unset. Same value, from the same variable, as
+        the LLM analyzer would write.
+        """
+        if self._provider_config is None:
+            try:
+                from .llm_provider_config import ProviderConfig
+
+                self._provider_config = ProviderConfig(
+                    # `or ""` satisfies the type checker only; _call_llm has
+                    # already returned when self.model is falsy.
+                    model=self.model or "",
+                    base_url=(
+                        os.environ.get("SKILL_SCANNER_ADJUDICATOR_LLM_BASE_URL")
+                        or os.environ.get("SKILL_SCANNER_LLM_BASE_URL")
+                    ),
+                    api_version=(
+                        os.environ.get("SKILL_SCANNER_ADJUDICATOR_LLM_API_VERSION")
+                        or os.environ.get("SKILL_SCANNER_LLM_API_VERSION")
+                    ),
+                )
+            except Exception as exc:
+                logger.debug("adjudicator could not resolve provider config: %s", exc)
+                self._provider_config = False
+
+        if self._provider_config is False:
+            return {}
+        try:
+            params = dict(self._provider_config.get_request_params())
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("adjudicator could not build provider request params: %s", exc)
+            return {}
+
+        # Adopt the normalised model ONLY for OpenAI-compatible providers, where
+        # ProviderConfig adds the `openai/` prefix LiteLLM requires to route at
+        # all -- a bare gateway model name raises "LLM Provider NOT provided".
+        # Deliberately not generalised: the Gemini normalisation targets the
+        # Google SDK, which this LiteLLM-only path cannot use.
+        if getattr(self._provider_config, "is_openai_compatible", False):
+            params["model"] = self._provider_config.model
+
+        # ProviderConfig defaults aws_region to us-east-1, so this key is always
+        # present for Bedrock. An explicit aws_region_name short-circuits
+        # LiteLLM's whole resolution chain -- model-ARN inference,
+        # AWS_REGION_NAME, AWS_DEFAULT_REGION, and the boto3 session that reads
+        # ~/.aws/config. Drop it unless the operator really set AWS_REGION, so a
+        # profile- or ARN-derived region keeps working as it did before this
+        # method supplied any parameters at all.
+        if "AWS_REGION" not in os.environ:
+            params.pop("aws_region_name", None)
+        return params
+
     def _call_llm(self, prompt: str) -> dict[str, Any] | None:
         """Send the prompt via LiteLLM sync completion.
 
@@ -343,8 +453,24 @@ class Adjudicator:
         if not self.model:
             return None
 
+        # Credentials and routing come from the same resolver the LLM analyzer uses.
+        # Without them the request carries no api_key/api_base, so LiteLLM falls back
+        # to provider-native discovery (``ANTHROPIC_API_KEY`` and friends) and every
+        # deployment configured the documented way -- via
+        # ``SKILL_SCANNER_LLM_API_KEY`` / ``SKILL_SCANNER_LLM_BASE_URL`` -- fails
+        # authentication.
+        #
+        # Spread FIRST so the adjudicator's own parameters win by construction
+        # rather than by a promise about what get_request_params returns today: a
+        # future `max_tokens` or `timeout` key there must not silently override
+        # this pass's deliberate 200-token cap and per-request timeout. `model` is
+        # the one value the resolver may legitimately override (OpenAI-compatible
+        # prefixing), so it is taken explicitly instead of being clobbered.
+        provider_params = self._provider_params()
+        model = provider_params.pop("model", None) or self.model
         request: dict[str, Any] = {
-            "model": self.model,
+            **provider_params,
+            "model": model,
             "messages": [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
@@ -376,9 +502,11 @@ class Adjudicator:
                             _time.sleep(delay)
                             continue
                     logger.debug("adjudicator LLM call failed: %s", exc)
+                    self._note_llm_failure(exc)
                     return None
             else:
                 logger.debug("adjudicator LLM call exhausted retries: %s", last_exc)
+                self._note_llm_failure(f"exhausted retries: {last_exc}")
                 return None
 
         # Extract the first JSON object from the response. Some models
@@ -387,11 +515,13 @@ class Adjudicator:
         end = content.rfind("}")
         if start == -1 or end == -1 or end <= start:
             logger.debug("adjudicator response had no JSON: %r", content[:200])
+            self._note_llm_failure("response contained no JSON object")
             return None
         try:
             return json.loads(content[start : end + 1])
         except json.JSONDecodeError:
             logger.debug("adjudicator response was invalid JSON: %r", content[start : end + 1][:200])
+            self._note_llm_failure("response was not valid JSON")
             return None
 
     def _adjudicate_one(self, finding: Finding, skill: Skill) -> AdjudicationResult:
