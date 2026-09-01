@@ -278,6 +278,10 @@ class Adjudicator:
         # policy level costs nothing on skills with no HIGH+ findings.
         self._rule_registry: Any = None
 
+        # Lazy-loaded provider config, for the same reason. ``False`` marks a
+        # resolution failure so it is attempted once, not per finding.
+        self._provider_config: Any = None
+
         # Audit records for every finding we considered (kept, skipped,
         # or demoted). Callers can attach these to scan_metadata for
         # traceability.
@@ -325,6 +329,45 @@ class Adjudicator:
             "severity": rule.default_severity or "",
         }
 
+    def _provider_params(self) -> dict[str, Any]:
+        """Resolve provider credentials and routing for the outbound request.
+
+        Delegates to :class:`ProviderConfig` -- the same resolver
+        ``LLMRequestHandler`` uses -- so the adjudicator honours
+        ``SKILL_SCANNER_LLM_API_KEY``, ``SKILL_SCANNER_LLM_BASE_URL`` and every
+        provider-specific mechanism it already implements (Azure Entra ID,
+        Bedrock bearer/IAM, Vertex ADC, Gemini's ``GEMINI_API_KEY`` handoff)
+        rather than re-deriving any of it here.
+
+        The config is built once and cached. ``ProviderConfig`` raises
+        ``ImportError`` when the provider's SDK is missing, and a resolver
+        failure must not be louder than the missing credential it is trying to
+        supply, so any exception degrades to an empty dict: the request then
+        goes out exactly as it did before this method existed, and the caller's
+        existing error path keeps the finding at its original severity.
+
+        ``self.model`` is deliberately passed through unchanged instead of
+        adopting ``ProviderConfig.model``. For Gemini with ``google-genai``
+        installed that attribute is normalised for the Google SDK, which this
+        LiteLLM-only call path cannot use.
+        """
+        if self._provider_config is None:
+            try:
+                from .llm_provider_config import ProviderConfig
+
+                self._provider_config = ProviderConfig(model=self.model or "")
+            except Exception as exc:
+                logger.debug("adjudicator could not resolve provider config: %s", exc)
+                self._provider_config = False
+
+        if self._provider_config is False:
+            return {}
+        try:
+            return dict(self._provider_config.get_request_params())
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("adjudicator could not build provider request params: %s", exc)
+            return {}
+
     def _call_llm(self, prompt: str) -> dict[str, Any] | None:
         """Send the prompt via LiteLLM sync completion.
 
@@ -354,6 +397,14 @@ class Adjudicator:
         }
         if self.temperature is not None:
             request["temperature"] = self.temperature
+        # Credentials and routing come from the same resolver the LLM analyzer uses.
+        # Without this the request carries no api_key/api_base, so LiteLLM falls back
+        # to provider-native discovery (``ANTHROPIC_API_KEY`` and friends) and every
+        # deployment configured the documented way -- via
+        # ``SKILL_SCANNER_LLM_API_KEY`` / ``SKILL_SCANNER_LLM_BASE_URL`` -- fails
+        # authentication. Keys cannot collide: get_request_params only ever returns
+        # api_key/azure_ad_token/api_base/api_version/user/aws_*.
+        request.update(self._provider_params())
 
         content = ""
         last_exc: Exception | None = None
