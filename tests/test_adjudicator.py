@@ -34,6 +34,7 @@ Plus:
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -510,23 +511,94 @@ class TestAdjudicatorProviderCredentials:
         monkeypatch.setenv("SKILL_SCANNER_LLM_MODEL", "gateway-model")
         monkeypatch.setenv("SKILL_SCANNER_LLM_PROVIDER", "openai-compatible")
         monkeypatch.setenv("SKILL_SCANNER_LLM_API_KEY", "sk-proxy-key")
+        monkeypatch.setenv("SKILL_SCANNER_LLM_BASE_URL", "https://gateway.example/v1")
         skill = _make_skill(tmp_path, "---\nname: test\n---\n\nSome content.\n")
         finding = _finding("PROMPT_INJECTION_CONCEALMENT", Severity.HIGH, line_number=4)
 
         with patch("litellm.completion") as mock_call:
             mock_call.return_value = _mock_litellm_response("real", 5)
-            adj = Adjudicator()
-            # base_url has no dedicated adjudicator env var; it reaches the request
-            # through ProviderConfig exactly as it does for the LLM analyzer.
-            adj._provider_config = None
-            with patch(
-                "skill_scanner.core.analyzers.llm_provider_config.ProviderConfig.get_request_params",
-                return_value={"api_key": "sk-proxy-key", "api_base": "https://gateway.example/v1"},
-            ):
-                adj.adjudicate([finding], skill)
+            Adjudicator().adjudicate([finding], skill)
 
-        assert mock_call.call_args.kwargs["api_base"] == "https://gateway.example/v1"
-        assert mock_call.call_args.kwargs["api_key"] == "sk-proxy-key"
+        kwargs = mock_call.call_args.kwargs
+        # Without api_base, LiteLLM routes by model name to the provider's PUBLIC
+        # endpoint -- so the gateway key and the scanned file body would both go
+        # somewhere the operator deliberately routed away from.
+        assert kwargs["api_base"] == "https://gateway.example/v1"
+        assert kwargs["api_key"] == "sk-proxy-key"
+        # LiteLLM cannot route a bare custom model name ("LLM Provider NOT
+        # provided"), so the prefix ProviderConfig adds has to survive.
+        assert kwargs["model"] == "openai/gateway-model"
+
+    def test_request_carries_api_version_for_azure(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILL_SCANNER_LLM_MODEL", "azure/gpt-4o")
+        monkeypatch.setenv("SKILL_SCANNER_LLM_API_KEY", "azure-key")
+        monkeypatch.setenv("SKILL_SCANNER_LLM_BASE_URL", "https://example.openai.azure.com")
+        monkeypatch.setenv("SKILL_SCANNER_LLM_API_VERSION", "2024-08-01-preview")
+        monkeypatch.delenv("SKILL_SCANNER_LLM_PROVIDER", raising=False)
+        skill = _make_skill(tmp_path, "---\nname: test\n---\n\nSome content.\n")
+        finding = _finding("PROMPT_INJECTION_CONCEALMENT", Severity.HIGH, line_number=4)
+
+        with patch("litellm.completion") as mock_call:
+            mock_call.return_value = _mock_litellm_response("real", 5)
+            Adjudicator().adjudicate([finding], skill)
+
+        # Azure rejects the call outright without both of these.
+        kwargs = mock_call.call_args.kwargs
+        assert kwargs["api_base"] == "https://example.openai.azure.com"
+        assert kwargs["api_version"] == "2024-08-01-preview"
+
+    def test_adjudicator_specific_base_url_overrides_scanner_wide(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILL_SCANNER_LLM_MODEL", "gateway-model")
+        monkeypatch.setenv("SKILL_SCANNER_LLM_PROVIDER", "openai-compatible")
+        monkeypatch.setenv("SKILL_SCANNER_LLM_API_KEY", "sk-proxy-key")
+        monkeypatch.setenv("SKILL_SCANNER_LLM_BASE_URL", "https://scanner-wide.example/v1")
+        monkeypatch.setenv("SKILL_SCANNER_ADJUDICATOR_LLM_BASE_URL", "https://adjudicator-only.example/v1")
+        skill = _make_skill(tmp_path, "---\nname: test\n---\n\nSome content.\n")
+        finding = _finding("PROMPT_INJECTION_CONCEALMENT", Severity.HIGH, line_number=4)
+
+        with patch("litellm.completion") as mock_call:
+            mock_call.return_value = _mock_litellm_response("real", 5)
+            Adjudicator().adjudicate([finding], skill)
+
+        # Mirrors the MODEL override tier: a different adjudicator model may live
+        # behind a different endpoint.
+        assert mock_call.call_args.kwargs["api_base"] == "https://adjudicator-only.example/v1"
+
+    def test_bedrock_region_is_not_pinned_when_aws_region_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILL_SCANNER_LLM_MODEL", "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0")
+        monkeypatch.delenv("AWS_REGION", raising=False)
+        monkeypatch.delenv("SKILL_SCANNER_LLM_PROVIDER", raising=False)
+        skill = _make_skill(tmp_path, "---\nname: test\n---\n\nSome content.\n")
+        finding = _finding("PROMPT_INJECTION_CONCEALMENT", Severity.HIGH, line_number=4)
+
+        with patch("litellm.completion") as mock_call:
+            mock_call.return_value = _mock_litellm_response("real", 5)
+            Adjudicator().adjudicate([finding], skill)
+
+        # ProviderConfig defaults the region to us-east-1. Forwarding that
+        # short-circuits LiteLLM's own resolution (model ARN, AWS_DEFAULT_REGION,
+        # ~/.aws/config profile), silently relocating requests for an operator who
+        # never set AWS_REGION.
+        assert "aws_region_name" not in mock_call.call_args.kwargs
+
+    def test_bedrock_region_is_forwarded_when_aws_region_set(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SKILL_SCANNER_LLM_MODEL", "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0")
+        monkeypatch.setenv("AWS_REGION", "eu-west-1")
+        monkeypatch.delenv("SKILL_SCANNER_LLM_PROVIDER", raising=False)
+        skill = _make_skill(tmp_path, "---\nname: test\n---\n\nSome content.\n")
+        finding = _finding("PROMPT_INJECTION_CONCEALMENT", Severity.HIGH, line_number=4)
+
+        with patch("litellm.completion") as mock_call:
+            mock_call.return_value = _mock_litellm_response("real", 5)
+            Adjudicator().adjudicate([finding], skill)
+
+        assert mock_call.call_args.kwargs["aws_region_name"] == "eu-west-1"
 
     def test_model_and_messages_are_not_overwritten_by_provider_params(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -565,3 +637,29 @@ class TestAdjudicatorProviderCredentials:
         # finding at its original severity if it fails.
         assert mock_call.call_count == 1
         assert finding.severity == Severity.HIGH
+
+    def test_first_llm_failure_is_reported_at_warning_once(
+        self, tmp_path: Path, with_model_env: None, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        skill = _make_skill(tmp_path, "---\nname: test\n---\n\nSome content.\n")
+        findings = [
+            _finding("PROMPT_INJECTION_CONCEALMENT", Severity.HIGH, line_number=4),
+            _finding("COMMAND_INJECTION_OS_SYSTEM", Severity.CRITICAL, line_number=4),
+        ]
+
+        with caplog.at_level(logging.WARNING):
+            with patch("litellm.completion", side_effect=RuntimeError("Missing API Key")):
+                Adjudicator().adjudicate(findings, skill)
+
+        # A wholly broken adjudicator used to be invisible: failures logged at
+        # DEBUG while `adjudicator` still appeared in analyzers_used, so a
+        # misconfiguration read as "no false positives found".
+        # Scope to this module's logger: rule_registry emits unrelated pack-load
+        # warnings that would otherwise be counted here.
+        warnings = [
+            r for r in caplog.records if r.levelno == logging.WARNING and r.name.endswith("analyzers.adjudicator")
+        ]
+        assert len(warnings) == 1, "expected exactly one WARNING per scan, not one per finding"
+        assert "not producing verdicts" in warnings[0].getMessage()
+        # Demote-only invariant is untouched by the new reporting.
+        assert all(f.severity in (Severity.HIGH, Severity.CRITICAL) for f in findings)
