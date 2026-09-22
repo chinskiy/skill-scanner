@@ -51,11 +51,25 @@ import yaml
 
 from ..utils.file_utils import FileValidationError, read_text_strict
 from .cel.models import CelMode
+from .suppressions import SuppressionRule, suppression_from_dict
 
 logger = logging.getLogger(__name__)
 
 _MAX_PATTERN_LENGTH = 1000
 _MAX_POLICY_SIZE_BYTES = 1024 * 1024
+
+
+def _drop_null_values(value: Any) -> Any:
+    """Remove null mapping keys recursively.
+
+    PyYAML parses a valueless key as ``None``. Treating it as absent lets policy
+    defaults apply without discarding other falsy values.
+    """
+    if isinstance(value, dict):
+        return {k: _drop_null_values(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_null_values(v) for v in value]
+    return value
 
 
 def _safe_compile(pattern: str, flags: int = 0, *, max_length: int = _MAX_PATTERN_LENGTH) -> re.Pattern | None:
@@ -470,6 +484,9 @@ class ScanPolicy:
     finding_output: FindingOutputPolicy = field(default_factory=FindingOutputPolicy)
     severity_overrides: list[SeverityOverride] = field(default_factory=list)
     disabled_rules: set[str] = field(default_factory=set)
+    # Scoped suppressions: silence or re-rate a rule for named skills/paths
+    # instead of disabling it for every skill in the run.
+    suppressions: list[SuppressionRule] = field(default_factory=list)
 
     # -----------------------------------------------------------------------
     # Convenience helpers
@@ -568,7 +585,7 @@ class ScanPolicy:
         raw_value = yaml.safe_load(content) or {}
         if not isinstance(raw_value, dict):
             raise ValueError("Policy YAML root must be a mapping")
-        raw: dict[str, Any] = raw_value
+        raw: dict[str, Any] = _drop_null_values(raw_value)
 
         # If this IS the default file, just parse directly
         is_default = os.path.realpath(os.fspath(path)) == os.path.realpath(os.fspath(_DEFAULT_POLICY_PATH))
@@ -621,23 +638,25 @@ class ScanPolicy:
 
     @classmethod
     def _from_dict(cls, d: dict[str, Any]) -> ScanPolicy:
-        hf = d.get("hidden_files", {})
-        pl = d.get("pipeline", {})
-        ys = d.get("rule_scoping", {})
-        cr = d.get("credentials", {})
-        sc = d.get("system_cleanup", {})
-        fc = d.get("file_classification", {})
-        fl = d.get("file_limits", {})
-        at = d.get("analysis_thresholds", {})
-        sf = d.get("sensitive_files", {})
-        cs = d.get("command_safety", {})
-        az = d.get("analyzers", {})
-        cel_policy = d.get("cel", {})
-        aj = d.get("adjudicator", {})
-        la = d.get("llm_analysis", {})
-        fo = d.get("finding_output", {})
+        # Support direct callers that pass None for optional sections.
+        hf = d.get("hidden_files") or {}
+        pl = d.get("pipeline") or {}
+        ys = d.get("rule_scoping") or {}
+        cr = d.get("credentials") or {}
+        sc = d.get("system_cleanup") or {}
+        fc = d.get("file_classification") or {}
+        fl = d.get("file_limits") or {}
+        at = d.get("analysis_thresholds") or {}
+        sf = d.get("sensitive_files") or {}
+        cs = d.get("command_safety") or {}
+        az = d.get("analyzers") or {}
+        cel_policy = d.get("cel") or {}
+        aj = d.get("adjudicator") or {}
+        la = d.get("llm_analysis") or {}
+        fo = d.get("finding_output") or {}
 
-        severity_overrides = [SeverityOverride(**ovr) for ovr in d.get("severity_overrides", [])]
+        severity_overrides = [SeverityOverride(**ovr) for ovr in d.get("severity_overrides") or []]
+        suppressions = [suppression_from_dict(entry) for entry in d.get("suppressions") or []]
 
         cel_mode_value = cel_policy.get("mode", "off")
         # PyYAML's YAML 1.1 resolver treats an unquoted ``off`` as False.
@@ -790,7 +809,8 @@ class ScanPolicy:
                 attach_policy_fingerprint=fo.get("attach_policy_fingerprint", True),
             ),
             severity_overrides=severity_overrides,
-            disabled_rules=set(d.get("disabled_rules", [])),
+            disabled_rules=set(d.get("disabled_rules") or []),
+            suppressions=suppressions,
         )
 
     def _to_dict(self) -> dict[str, Any]:
@@ -912,4 +932,5 @@ class ScanPolicy:
                 {"rule_id": o.rule_id, "severity": o.severity, "reason": o.reason} for o in self.severity_overrides
             ],
             "disabled_rules": sorted(self.disabled_rules),
+            "suppressions": [s.to_dict() for s in self.suppressions],
         }

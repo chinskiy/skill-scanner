@@ -70,6 +70,8 @@ class TableReporter:
             ["Total Findings", len(result.findings)],
             ["Scan Duration", f"{result.scan_duration_seconds:.2f}s"],
         ]
+        if result.suppressed_findings:
+            summary_data.insert(4, ["Suppressed by Policy", len(result.suppressed_findings)])
         lines.append(tabulate(summary_data, tablefmt=self.format_style))
         lines.append("")
 
@@ -153,6 +155,9 @@ class TableReporter:
             ["Low", report.low_count],
             ["Info", report.info_count],
         ]
+        total_suppressed = sum(len(r.suppressed_findings) for r in report.scan_results)
+        if total_suppressed:
+            summary_data.append(["Suppressed by Policy", total_suppressed])
         lines.append(tabulate(summary_data, tablefmt=self.format_style))
         lines.append("")
 
@@ -160,16 +165,17 @@ class TableReporter:
         lines.append("Skills Overview:")
         skills_data = []
         for result in report.scan_results:
-            skills_data.append(
-                [
-                    result.skill_name,
-                    "[OK] SAFE" if result.is_safe else "[FAIL] ISSUES",
-                    result.max_severity.value,
-                    len(result.findings),
-                    len(result.get_findings_by_severity(Severity.CRITICAL)),
-                    len(result.get_findings_by_severity(Severity.HIGH)),
-                ]
-            )
+            row = [
+                result.skill_name,
+                "[OK] SAFE" if result.is_safe else "[FAIL] ISSUES",
+                result.max_severity.value,
+                len(result.findings),
+                len(result.get_findings_by_severity(Severity.CRITICAL)),
+                len(result.get_findings_by_severity(Severity.HIGH)),
+            ]
+            if total_suppressed:
+                row.append(len(result.suppressed_findings))
+            skills_data.append(row)
 
         if report.cross_skill_findings:
             _SEVERITY_PRIORITY = [Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW, Severity.INFO]
@@ -178,21 +184,27 @@ class TableReporter:
                 if any(f.severity == sev for f in report.cross_skill_findings):
                     max_sev = sev
                     break
-            skills_data.append(
-                [
-                    "[cross-skill]",
-                    "",
-                    max_sev.value,
-                    len(report.cross_skill_findings),
-                    sum(1 for f in report.cross_skill_findings if f.severity == Severity.CRITICAL),
-                    sum(1 for f in report.cross_skill_findings if f.severity == Severity.HIGH),
-                ]
-            )
+            cross_row = [
+                "[cross-skill]",
+                "",
+                max_sev.value,
+                len(report.cross_skill_findings),
+                sum(1 for f in report.cross_skill_findings if f.severity == Severity.CRITICAL),
+                sum(1 for f in report.cross_skill_findings if f.severity == Severity.HIGH),
+            ]
+            if total_suppressed:
+                # Scoped suppressions never apply to cross-skill findings.
+                cross_row.append(0)
+            skills_data.append(cross_row)
+
+        headers = ["Skill", "Status", "Max Severity", "Total", "Critical", "High"]
+        if total_suppressed:
+            headers.append("Suppressed")
 
         lines.append(
             tabulate(
                 skills_data,
-                headers=["Skill", "Status", "Max Severity", "Total", "Critical", "High"],
+                headers=headers,
                 tablefmt=self.format_style,
             )
         )

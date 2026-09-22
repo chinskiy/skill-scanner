@@ -241,6 +241,79 @@ def test_sarif_reporter_multi_skill_github_compat(report: Report):
         assert "fixes" not in result
 
 
+def _suppressed_result() -> ScanResult:
+    hidden = Finding(
+        id="FIND-004",
+        rule_id="HOMOGLYPH_ATTACK",
+        category=ThreatCategory.OBFUSCATION,
+        severity=Severity.HIGH,
+        title="Mixed-script text",
+        description="Non-ASCII prose read as obfuscation.",
+        file_path="docs/guide.md",
+        analyzer="static",
+        metadata={"suppression": {"rule_id": "HOMOGLYPH_ATTACK", "reason": "Cyrillic prose", "matched_skill": "docs"}},
+    )
+    return ScanResult(
+        skill_name="docs",
+        skill_directory="/tmp/docs",
+        findings=_sample_findings(),
+        suppressed_findings=[hidden],
+        timestamp=datetime(2026, 1, 2, 3, 4, 5),
+    )
+
+
+def test_sarif_reporter_marks_policy_suppressed_findings():
+    data = json.loads(SARIFReporter().generate_report(_suppressed_result()))
+
+    results = data["runs"][0]["results"]
+    suppressed = [r for r in results if "suppressions" in r]
+    assert len(suppressed) == 1
+    assert suppressed[0]["ruleId"] == "HOMOGLYPH_ATTACK"
+    assert suppressed[0]["suppressions"] == [{"kind": "external", "justification": "Cyrillic prose"}]
+
+    # The rule definition must travel with it, or the ruleId dangles.
+    assert "HOMOGLYPH_ATTACK" in {rule["id"] for rule in data["runs"][0]["tool"]["driver"]["rules"]}
+    assert all("suppressions" not in r for r in results if r["ruleId"] != "HOMOGLYPH_ATTACK")
+
+
+def test_sarif_reporter_builds_a_fallback_justification_from_the_selector():
+    result = _suppressed_result()
+    result.suppressed_findings[0].metadata["suppression"]["reason"] = ""
+
+    data = json.loads(SARIFReporter().generate_report(result))
+    suppressed = next(item for item in data["runs"][0]["results"] if "suppressions" in item)
+
+    assert suppressed["suppressions"][0]["justification"] == "Suppressed by scan policy (selector: docs)"
+
+
+def test_sarif_reporter_emits_no_suppressions_by_default(scan_result: ScanResult):
+    data = json.loads(SARIFReporter().generate_report(scan_result))
+    assert all("suppressions" not in result for result in data["runs"][0]["results"])
+
+
+def test_json_reporter_omits_suppressed_findings_when_none(scan_result: ScanResult):
+    data = json.loads(JSONReporter().generate_report(scan_result))
+    assert "suppressed_findings" not in data
+
+
+def test_json_reporter_includes_suppressed_findings_when_present():
+    data = json.loads(JSONReporter().generate_report(_suppressed_result()))
+    assert [f["rule_id"] for f in data["suppressed_findings"]] == ["HOMOGLYPH_ATTACK"]
+    # Suppressed findings must not inflate the reported count.
+    assert data["findings_count"] == len(data["findings"])
+
+
+def test_single_skill_text_reports_include_the_suppressed_count():
+    result = _suppressed_result()
+
+    markdown = MarkdownReporter().generate_report(result)
+    table = TableReporter(format_style="plain").generate_report(result)
+
+    assert "- **Suppressed by policy:** 1" in markdown
+    row = next(line for line in table.splitlines() if line.startswith("Suppressed by Policy"))
+    assert row.split()[-1] == "1"
+
+
 def _result_uris(sarif_output: str) -> list[str]:
     data = json.loads(sarif_output)
     return [
@@ -306,3 +379,62 @@ def test_sarif_reporter_uri_unchanged_when_skill_outside_scan_root(scan_result: 
     assert "scripts/decoder.py" in uris
     for uri in uris:
         assert ".." not in uri
+
+
+def _report_with_suppressions() -> Report:
+    """Two suppressed findings, so the count differs from every other column."""
+    suppressed = _suppressed_result()
+    second = Finding(
+        id="FIND-005",
+        rule_id="ARCHIVE_FILE_DETECTED",
+        category=ThreatCategory.POLICY_VIOLATION,
+        severity=Severity.MEDIUM,
+        title="Archive in skill",
+        description="Archives are expected here.",
+        file_path="fixtures/sample.zip",
+        analyzer="static",
+        metadata={"suppression": {"rule_id": "ARCHIVE_FILE_DETECTED", "reason": "Test fixtures"}},
+    )
+    suppressed.suppressed_findings.append(second)
+
+    aggregate = Report(timestamp=datetime(2026, 1, 2, 3, 6, 0))
+    aggregate.add_scan_result(suppressed)
+    aggregate.add_scan_result(
+        ScanResult(
+            skill_name="clean",
+            skill_directory="/tmp/clean",
+            findings=[],
+            timestamp=datetime(2026, 1, 2, 3, 5, 0),
+        )
+    )
+    return aggregate
+
+
+def test_markdown_multi_skill_reports_suppressed_counts():
+    output = MarkdownReporter().generate_report(_report_with_suppressions())
+    assert "- **Suppressed by policy:** 2" in output
+
+
+def test_table_multi_skill_reports_suppressed_counts():
+    report = _report_with_suppressions()
+    report.add_cross_skill_findings([_sample_findings()[0]])
+    output = TableReporter(format_style="plain").generate_report(report)
+
+    lines = output.splitlines()
+    summary_row = next(line for line in lines if line.startswith("Suppressed by Policy"))
+    assert summary_row.split()[-1] == "2"
+
+    # The fixture suppresses two findings so the count differs from every other
+    # number in the row; asserting the last column then cannot pass by matching
+    # a neighbouring one.
+    docs_row = next(line for line in lines if line.startswith("docs "))
+    clean_row = next(line for line in lines if line.startswith("clean "))
+    cross_skill_row = next(line for line in lines if line.startswith("[cross-skill] "))
+    assert docs_row.split()[-1] == "2"
+    assert clean_row.split()[-1] == "0"
+    assert cross_skill_row.split()[-1] == "0"
+
+
+def test_multi_skill_reports_unchanged_without_suppressions(report: Report):
+    assert "Suppressed" not in MarkdownReporter().generate_report(report)
+    assert "Suppressed" not in TableReporter().generate_report(report)

@@ -138,6 +138,7 @@ Implemented in `skill_scanner/core/scan_policy.py` with built-ins in `skill_scan
 - `finding_output`
 - `severity_overrides`
 - `disabled_rules`
+- `suppressions`
 
 ### Policy capabilities
 
@@ -145,6 +146,8 @@ Implemented in `skill_scanner/core/scan_policy.py` with built-ins in `skill_scan
 - Deep-merge custom YAML overlays on defaults
 - Rule severity remapping without rule removal
 - Full rule disablement where required
+- Scoped suppression or downgrade of a rule for named skills or paths, with a
+  recorded reason, an optional expiry, and an audit trail in JSON and SARIF
 - Output-level dedupe and metadata controls
 
 ## CLI Features

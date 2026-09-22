@@ -38,6 +38,7 @@ Every organisation has a different security bar. A **scan policy** captures what
   - [finding_output](#finding_output)
   - [severity_overrides](#severity_overrides)
   - [disabled_rules](#disabled_rules)
+  - [suppressions](#suppressions)
 - [Interactive Configurator (TUI)](#interactive-configurator-tui)
 - [Examples](#examples)
 
@@ -181,7 +182,7 @@ Then edit the generated file to add your trusted domains, extra benign dotfiles,
 
 - **Lists replace, don't append.** If you override `known_installer_domains`, include *all* domains you want — the default list is discarded.
 - **Use `severity_overrides` to tune, not disable.** Instead of disabling a noisy rule, consider demoting it to `LOW` or `INFO`.
-- **Use `disabled_rules` sparingly.** Disabled rules produce zero findings, which means zero visibility.
+- **Use `disabled_rules` sparingly.** Disabled rules produce zero findings, which means zero visibility. When a rule is only wrong in one place, reach for `suppressions` instead — it scopes the exception to the skills or paths it was reviewed for and keeps the rule live everywhere else.
 - **Version your policies.** Use `policy_version` and commit policies to your repo so changes are tracked.
 - **Keep ownership clean.** Use policy YAML for allowlists/thresholds/scoping, keep YARA/signatures for detection logic, and avoid duplicating the same decision in multiple layers.
 - **Keep optional packs explicit.** The core pack is always present; enable ATR
@@ -192,7 +193,7 @@ Then edit the generated file to add your trusted domains, extra benign dotfiles,
 
 - **ID conventions:** Keep signature IDs in `SCREAMING_SNAKE_CASE` (e.g. `DATA_EXFIL_HTTP_POST`) and YARA findings as `YARA_<rule_name>` (e.g. `YARA_code_execution_generic`).
 - **Severity strategy:** Use detector defaults for baseline severity; apply org-specific risk posture via `severity_overrides`.
-- **Scoping strategy:** Use `rule_scoping` for context-aware enablement (docs/code/SKILL.md), not `disabled_rules`.
+- **Scoping strategy:** Use `rule_scoping` for context-aware enablement (docs/code/SKILL.md), not `disabled_rules`. For an exception that belongs to one skill or one path rather than to a file category, use `suppressions`.
 - **Suppression strategy:** Put known placeholders and safe cleanup paths in policy (`credentials`, `system_cleanup`) instead of hardcoding in analyzers.
 
 ---
@@ -202,7 +203,7 @@ Then edit the generated file to add your trusted domains, extra benign dotfiles,
 Click any section to expand its configuration keys and YAML examples.
 
 <details>
-<summary>Metadata</summary>
+<summary id="metadata">Metadata</summary>
 
 ```yaml
 policy_name: my-org              # Display name for reports
@@ -215,7 +216,7 @@ preset_base: strict              # Which preset this derives from (strict / bala
 </details>
 
 <details>
-<summary>cel</summary>
+<summary id="cel">cel</summary>
 
 Controls the typed CEL decision layer that runs after deterministic analyzers
 and before optional LLM analysis.
@@ -240,7 +241,7 @@ bundled finding. Use `--cel-mode` to override this setting for one invocation.
 </details>
 
 <details>
-<summary>hidden_files</summary>
+<summary id="hidden_files">hidden_files</summary>
 
 Controls which dotfiles and dot-directories are treated as benign (not flagged as hidden data).
 
@@ -260,7 +261,7 @@ hidden_files:
 </details>
 
 <details>
-<summary>pipeline</summary>
+<summary id="pipeline">pipeline</summary>
 
 Controls the pipeline taint analysis engine.
 
@@ -297,7 +298,7 @@ pipeline:
 </details>
 
 <details>
-<summary>rule_scoping</summary>
+<summary id="rule_scoping">rule_scoping</summary>
 
 Controls which rule sets (YARA and other analyzers) fire on which file categories.
 
@@ -330,7 +331,7 @@ rule_scoping:
 </details>
 
 <details>
-<summary>credentials</summary>
+<summary id="credentials">credentials</summary>
 
 Controls which well-known test credentials are automatically suppressed.
 
@@ -352,7 +353,7 @@ credentials:
 </details>
 
 <details>
-<summary>system_cleanup</summary>
+<summary id="system_cleanup">system_cleanup</summary>
 
 Controls which cleanup targets are considered safe when `rm -r`/`rm -rf` patterns are detected.
 
@@ -370,7 +371,7 @@ system_cleanup:
 </details>
 
 <details>
-<summary>file_classification</summary>
+<summary id="file_classification">file_classification</summary>
 
 Controls how file extensions are routed for analysis.
 
@@ -415,7 +416,7 @@ file_classification:
 </details>
 
 <details>
-<summary>file_limits</summary>
+<summary id="file_limits">file_limits</summary>
 
 Numeric thresholds for file inventory checks.
 
@@ -438,7 +439,7 @@ file_limits:
 </details>
 
 <details>
-<summary>analysis_thresholds</summary>
+<summary id="analysis_thresholds">analysis_thresholds</summary>
 
 Numeric thresholds for YARA and analyzability scoring.
 
@@ -467,7 +468,7 @@ analysis_thresholds:
 </details>
 
 <details>
-<summary>sensitive_files</summary>
+<summary id="sensitive_files">sensitive_files</summary>
 
 Regex patterns for file paths that upgrade taint in pipeline analysis.
 
@@ -486,7 +487,7 @@ sensitive_files:
 </details>
 
 <details>
-<summary>command_safety</summary>
+<summary id="command_safety">command_safety</summary>
 
 Controls which commands belong to each safety tier. The scanner uses a tiered evaluation to decide whether a `code_execution_generic` YARA finding should be suppressed (safe/caution) or kept (risky/dangerous).
 
@@ -523,7 +524,7 @@ command_safety:
 </details>
 
 <details>
-<summary>analyzers</summary>
+<summary id="analyzers">analyzers</summary>
 
 Enable or disable entire analysis passes.
 
@@ -540,7 +541,7 @@ analyzers:
 </details>
 
 <details>
-<summary>llm_analysis</summary>
+<summary id="llm_analysis">llm_analysis</summary>
 
 Controls prompt budget limits for the LLM analyzer and meta-analyzer. The meta-analyzer multiplies the base limits by `meta_budget_multiplier` so it always has more headroom for cross-correlation.
 
@@ -566,7 +567,7 @@ llm_analysis:
 </details>
 
 <details>
-<summary>finding_output</summary>
+<summary id="finding_output">finding_output</summary>
 
 Controls final finding dedupe behavior and metadata stamping.
 
@@ -603,7 +604,7 @@ Field behavior:
 </details>
 
 <details>
-<summary>severity_overrides</summary>
+<summary id="severity_overrides">severity_overrides</summary>
 
 Per-rule severity overrides — raise or lower any rule's severity without disabling it.
 
@@ -625,7 +626,7 @@ severity_overrides:
 </details>
 
 <details>
-<summary>disabled_rules</summary>
+<summary id="disabled_rules">disabled_rules</summary>
 
 Completely suppress specific rule IDs — they produce zero findings.
 
@@ -639,6 +640,63 @@ disabled_rules:
 **Impact:** Disabled rules are never evaluated. Use sparingly — prefer `severity_overrides` to demote rather than silence.
 
 **Important:** Do not list a rule in both `disabled_rules` and `rule_scoping`. If a rule is disabled, scoping entries for that rule are ignored.
+
+</details>
+
+<details>
+<summary id="suppressions">suppressions</summary>
+
+Silence — or re-rate — a rule for the skills and paths it was reviewed for,
+instead of switching it off for every skill in the run.
+
+```yaml
+suppressions:
+  - rule_id: HOMOGLYPH_ATTACK
+    skills: ["docs-translator"]
+    reason: "Skill legitimately contains Cyrillic prose"
+    expires: 2030-12-31
+
+  - rule_id: ARCHIVE_FILE_DETECTED
+    paths: ["**/fixtures/**/*.zip"]
+    reason: "Test fixtures"
+
+  - rule_id: PDF_STRUCTURAL_THREAT
+    skills: ["report-builder"]
+    paths: ["assets/*.pdf"]
+    severity: LOW
+    reason: "Reviewed; re-rated, not hidden"
+```
+
+**Fields:**
+
+| Field | Required | Meaning |
+|---|---|---|
+| `rule_id` | yes | The rule the entry applies to |
+| `skills` | one of the two | Globs matched against the skill name |
+| `paths` | one of the two | Globs matched against the file path, relative to the skill directory |
+| `reason` | no | Justification; surfaced in JSON and as the SARIF suppression justification |
+| `severity` | no | Re-rate the finding to this severity — raise or lower — and keep it, instead of suppressing it |
+| `expires` | no | ISO date (`YYYY-MM-DD`); after it the entry is inert and a warning is logged |
+
+**Matching:** patterns within one selector are ORed; when both `skills` and
+`paths` are given, both must match. `*` and `?` never cross a `/` — use `**` to
+span directories. Matching is case-insensitive and Windows separators are
+normalized.
+
+**Every entry needs at least one selector.** A selector-less entry is rejected at
+load time: it would be indistinguishable from `disabled_rules`.
+
+**Impact:** A suppressed finding is removed from `findings`, so it does not
+affect the verdict, the severity counters, or the exit code. It is *not*
+discarded:
+
+- it appears under `suppressed_findings` in JSON output,
+- the scan metadata gains a `suppressions` summary with per-entry counts,
+- SARIF emits it as a suppressed result (`"suppressions": [{"kind": "external", …}]`),
+  so GitHub Code Scanning shows it as dismissed rather than losing it.
+
+**Limitation:** cross-skill findings are never suppressed by a scoped entry —
+they have no owning skill and no real file path. Use `disabled_rules` for those.
 
 </details>
 
