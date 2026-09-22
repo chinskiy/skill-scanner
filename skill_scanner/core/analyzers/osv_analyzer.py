@@ -154,6 +154,41 @@ def _pipfile_requirement(name: str, spec: Any) -> str | None:
     return None
 
 
+def _vulns_per_dependency(payload: object, count: int) -> list[list[dict]]:
+    """Extract one advisory list per queried dependency from an OSV response.
+
+    The response comes from an external service, so its shape is validated rather
+    than trusted: a malformed body raises ``ValueError``, which the caller already
+    treats as a failed chunk and fails open on.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("OSV response body is not a JSON object")
+    results = payload.get("results", [])
+    if not isinstance(results, list):
+        raise ValueError("OSV response 'results' is not a list")
+
+    extracted: list[list[dict]] = []
+    for index in range(count):
+        entry = results[index] if index < len(results) else None
+        vulns = entry.get("vulns") if isinstance(entry, dict) else None
+        extracted.append([v for v in vulns if isinstance(v, dict)] if isinstance(vulns, list) else [])
+    return extracted
+
+
+def _positive_bound(value: object, default: int, name: str) -> int:
+    """Return ``value`` when it is a positive integer, else the default for ``None``.
+
+    A silently accepted zero or negative bound is worse than an error: a negative
+    chunk size yields no query chunks at all, and a negative cap truncates from
+    the wrong end.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return value
+
+
 def _coordinates(dependency: ResolvedDependency) -> str:
     """Render a dependency the way its ecosystem writes it."""
     separator = "@" if dependency.ecosystem == NPM_ECOSYSTEM else "=="
@@ -201,8 +236,8 @@ class OSVAnalyzer(BaseAnalyzer):
         self.enabled = enabled
         self.ecosystem = ecosystem
         self.timeout = timeout
-        self.chunk_size = chunk_size or self.QUERY_CHUNK_SIZE
-        self.max_dependencies = max_dependencies or self.MAX_DEPENDENCIES
+        self.chunk_size = _positive_bound(chunk_size, self.QUERY_CHUNK_SIZE, "chunk_size")
+        self.max_dependencies = _positive_bound(max_dependencies, self.MAX_DEPENDENCIES, "max_dependencies")
         self._client = httpx.Client(timeout=timeout)
 
     def analyze(self, skill: Skill) -> list[Finding]:
@@ -358,10 +393,7 @@ class OSVAnalyzer(BaseAnalyzer):
         }
         response = self._client.post(self.QUERYBATCH_URL, json=payload)
         response.raise_for_status()
-        results = response.json().get("results", [])
-        return [
-            (results[index].get("vulns") or []) if index < len(results) else [] for index in range(len(dependencies))
-        ]
+        return _vulns_per_dependency(response.json(), len(dependencies))
 
     def _create_finding(self, dependency: ResolvedDependency, vulns: list[dict]) -> Finding:
         vuln_ids = [vuln_id for v in vulns if isinstance((vuln_id := v.get("id")), str) and vuln_id]
