@@ -82,16 +82,21 @@ class DeclaredDependency(NamedTuple):
     dev: bool = False
 
 
-def is_npm_manifest(relative_path: str) -> bool:
-    """True for a ``package.json`` the package itself declares.
+def is_vendored(relative_path: str) -> bool:
+    """True for a path inside an installed dependency tree.
 
-    A manifest under ``node_modules/`` belongs to an installed dependency, not
-    the author: a vendored tree would contribute thousands of unfixable findings.
+    Content under ``node_modules/`` belongs to an installed package, not to the
+    author: its declarations are not theirs to pin, and its lockfiles say nothing
+    about what this package declares.
     """
-    path = Path(relative_path)
-    if path.name.lower() != NPM_MANIFEST_NAME:
+    return _INSTALL_DIR in Path(relative_path).parts
+
+
+def is_npm_manifest(relative_path: str) -> bool:
+    """True for a ``package.json`` the package itself declares."""
+    if Path(relative_path).name.lower() != NPM_MANIFEST_NAME:
         return False
-    return _INSTALL_DIR not in path.parts
+    return not is_vendored(relative_path)
 
 
 def _first_line_containing(content: str, needle: str) -> int | None:
@@ -158,6 +163,11 @@ def entries_from_package_json(path: str, content: str) -> list[DeclaredDependenc
     if not isinstance(data, dict):
         return []
 
+    # npm resolves a duplicate name to the optionalDependencies spec, so the
+    # entry in dependencies is not the one that gets installed.
+    optional = data.get("optionalDependencies")
+    overridden = set(optional) if isinstance(optional, dict) else set()
+
     entries: list[DeclaredDependency] = []
     for section, is_dev in _DEPENDENCY_SECTIONS:
         declared = data.get(section)
@@ -165,6 +175,8 @@ def entries_from_package_json(path: str, content: str) -> list[DeclaredDependenc
             continue
         for key, spec in declared.items():
             if not isinstance(key, str) or not key or not isinstance(spec, str):
+                continue
+            if section == "dependencies" and key in overridden:
                 continue
             name, resolved_spec = key, spec
             alias = _ALIAS_RE.match(spec.strip())

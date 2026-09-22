@@ -72,6 +72,7 @@ from .npm_manifest import (
     classify_spec,
     entries_from_package_json,
     is_npm_manifest,
+    is_vendored,
 )
 
 logger = logging.getLogger(__name__)
@@ -2574,7 +2575,9 @@ class StaticAnalyzer(BaseAnalyzer):
         ``optionalDependencies``).
         """
         findings: list[Finding] = []
-        present = {Path(f.relative_path).name.lower() for f in skill.files}
+        # A lockfile inside an installed dependency freezes that package's tree,
+        # not this one's, so it must not suppress the skill's own manifests.
+        present = {Path(f.relative_path).name.lower() for f in skill.files if not is_vendored(f.relative_path)}
 
         # A lockfile makes ranges intentional -- for its own ecosystem only.
         if present.isdisjoint(self._PYTHON_LOCKFILE_NAMES):

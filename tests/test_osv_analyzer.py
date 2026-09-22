@@ -340,6 +340,48 @@ class TestNpmManifest:
         assert analyzer._client.last_payload["queries"][0]["package"]["name"] == "real-pkg"
 
 
+class TestMalformedResponses:
+    """A shape-malformed response must fail open, not abort the scan."""
+
+    def test_non_mapping_result_entry_fails_open(self, make_skill):
+        skill = make_skill({"SKILL.md": _SKILL_MD, "package.json": json.dumps({"dependencies": {"lodash": "4.17.15"}})})
+        analyzer = _make_analyzer(_FakeClient(response=_FakeResponse({"results": ["not-a-mapping"]})))
+        assert analyzer.analyze(skill) == []
+
+    def test_non_mapping_vulnerability_entry_is_ignored(self, make_skill):
+        skill = make_skill({"SKILL.md": _SKILL_MD, "package.json": json.dumps({"dependencies": {"lodash": "4.17.15"}})})
+        response = _FakeResponse({"results": [{"vulns": ["not-a-mapping", {"id": "GHSA-real"}]}]})
+        analyzer = _make_analyzer(_FakeClient(response=response))
+
+        findings = analyzer.analyze(skill)
+        assert len(findings) == 1
+        assert findings[0].metadata["vulnerability_ids"] == ["GHSA-real"]
+
+    def test_results_not_a_list_fails_open(self, make_skill):
+        skill = make_skill({"SKILL.md": _SKILL_MD, "package.json": json.dumps({"dependencies": {"lodash": "4.17.15"}})})
+        analyzer = _make_analyzer(_FakeClient(response=_FakeResponse({"results": "nope"})))
+        assert analyzer.analyze(skill) == []
+
+
+class TestBoundsValidation:
+    """Query bounds are positive integers; None keeps the default."""
+
+    @pytest.mark.parametrize("value", [0, -1, -5, 1.5, "5"])
+    def test_invalid_chunk_size_rejected(self, value):
+        with pytest.raises(ValueError):
+            OSVAnalyzer(enabled=True, chunk_size=value)
+
+    @pytest.mark.parametrize("value", [0, -1, 2.5, "10"])
+    def test_invalid_max_dependencies_rejected(self, value):
+        with pytest.raises(ValueError):
+            OSVAnalyzer(enabled=True, max_dependencies=value)
+
+    def test_none_keeps_defaults(self):
+        analyzer = OSVAnalyzer(enabled=True)
+        assert analyzer.chunk_size == OSVAnalyzer.QUERY_CHUNK_SIZE
+        assert analyzer.max_dependencies == OSVAnalyzer.MAX_DEPENDENCIES
+
+
 class TestQueryBatching:
     """Lockfiles can list thousands of packages, so queries are bounded."""
 

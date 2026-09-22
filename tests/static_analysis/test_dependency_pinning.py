@@ -347,6 +347,19 @@ class TestLockfileSuppressionIsPerEcosystem:
 class TestVendoredManifestsIgnored:
     """A bundled node_modules tree is not the skill's own declaration."""
 
+    def test_vendored_lockfile_does_not_suppress_own_manifest(self, analyzer, make_skill):
+        # A lockfile belonging to an installed package says nothing about what
+        # this skill declares.
+        skill = make_skill(
+            {
+                "SKILL.md": _SKILL_MD,
+                "package.json": json.dumps({"dependencies": {"chalk": "^5.0.0"}}),
+                "node_modules/vendor/yarn.lock": "# yarn lockfile v1\n",
+            }
+        )
+        findings = analyzer._check_dependency_pinning(skill)
+        assert [finding.file_path for finding in findings] == ["package.json"]
+
     def test_node_modules_manifests_not_flagged(self, analyzer, make_skill):
         skill = make_skill(
             {

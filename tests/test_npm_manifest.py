@@ -152,6 +152,13 @@ class TestEntriesFromPackageJson:
         content = json.dumps({"dependencies": {"aliased": "npm:real-pkg@^1.0.0"}})
         assert _by_name(entries_from_package_json("package.json", content)) == {"real-pkg": "^1.0.0"}
 
+    def test_optional_dependency_overrides_duplicate_name(self):
+        # npm: "Entries in optionalDependencies will override entries of the
+        # same name in dependencies".
+        content = json.dumps({"dependencies": {"foo": "1.0.0"}, "optionalDependencies": {"foo": "2.0.0"}})
+        entries = entries_from_package_json("package.json", content)
+        assert [(e.name, e.spec) for e in entries] == [("foo", "2.0.0")]
+
     def test_collects_scoped_names(self):
         content = json.dumps({"dependencies": {"@babel/traverse": "7.23.1"}})
         assert _by_name(entries_from_package_json("package.json", content)) == {"@babel/traverse": "7.23.1"}
