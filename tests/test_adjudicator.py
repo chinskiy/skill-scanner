@@ -547,25 +547,6 @@ class TestAdjudicatorProviderCredentials:
         assert kwargs["api_base"] == "https://example.openai.azure.com"
         assert kwargs["api_version"] == "2024-08-01-preview"
 
-    def test_adjudicator_specific_base_url_overrides_scanner_wide(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("SKILL_SCANNER_LLM_MODEL", "gateway-model")
-        monkeypatch.setenv("SKILL_SCANNER_LLM_PROVIDER", "openai-compatible")
-        monkeypatch.setenv("SKILL_SCANNER_LLM_API_KEY", "sk-proxy-key")
-        monkeypatch.setenv("SKILL_SCANNER_LLM_BASE_URL", "https://scanner-wide.example/v1")
-        monkeypatch.setenv("SKILL_SCANNER_ADJUDICATOR_LLM_BASE_URL", "https://adjudicator-only.example/v1")
-        skill = _make_skill(tmp_path, "---\nname: test\n---\n\nSome content.\n")
-        finding = _finding("PROMPT_INJECTION_CONCEALMENT", Severity.HIGH, line_number=4)
-
-        with patch("litellm.completion") as mock_call:
-            mock_call.return_value = _mock_litellm_response("real", 5)
-            Adjudicator().adjudicate([finding], skill)
-
-        # Mirrors the MODEL override tier: a different adjudicator model may live
-        # behind a different endpoint.
-        assert mock_call.call_args.kwargs["api_base"] == "https://adjudicator-only.example/v1"
-
     def test_bedrock_region_is_not_pinned_when_aws_region_unset(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

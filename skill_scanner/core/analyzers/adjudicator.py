@@ -379,10 +379,7 @@ class Adjudicator:
         do that for their own call sites. Omitting them would be worse than
         sending nothing: an OpenAI-compatible gateway config would ship the
         gateway's ``api_key`` and the scanned file body to the provider's public
-        endpoint instead of the configured gateway. The two-tier lookup mirrors
-        ``meta_analyzer``, since ``SKILL_SCANNER_ADJUDICATOR_LLM_MODEL`` already
-        lets the adjudicator run a different model, which may need a different
-        endpoint.
+        endpoint instead of the configured gateway.
 
         A resolver failure must not be louder than the credential it is trying
         to supply, so any exception degrades to ``None``: the request then goes
@@ -392,14 +389,8 @@ class Adjudicator:
         try:
             return ProviderConfig(
                 model=model,
-                base_url=(
-                    os.environ.get("SKILL_SCANNER_ADJUDICATOR_LLM_BASE_URL")
-                    or os.environ.get("SKILL_SCANNER_LLM_BASE_URL")
-                ),
-                api_version=(
-                    os.environ.get("SKILL_SCANNER_ADJUDICATOR_LLM_API_VERSION")
-                    or os.environ.get("SKILL_SCANNER_LLM_API_VERSION")
-                ),
+                base_url=os.environ.get("SKILL_SCANNER_LLM_BASE_URL"),
+                api_version=os.environ.get("SKILL_SCANNER_LLM_API_VERSION"),
                 provider=self.provider,
             )
         except Exception as exc:
