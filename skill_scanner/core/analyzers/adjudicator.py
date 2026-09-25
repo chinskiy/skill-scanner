@@ -288,7 +288,8 @@ class Adjudicator:
         # environment the LLM analyzer reads at its own construction -- not
         # per finding, when the environment may no longer be the one the
         # operator configured. ``None`` means unavailable (no model, or the
-        # resolver failed); the request then goes out without them.
+        # resolver failed); no request is sent in that state.
+        self._provider_config_error: str | None = None
         self._provider_config: ProviderConfig | None = self._build_provider_config(model) if model else None
 
         # Latch so a broken LLM path is reported once per scan, not per finding.
@@ -381,10 +382,12 @@ class Adjudicator:
         gateway's ``api_key`` and the scanned file body to the provider's public
         endpoint instead of the configured gateway.
 
-        A resolver failure must not be louder than the credential it is trying
-        to supply, so any exception degrades to ``None``: the request then goes
-        out exactly as it did before credentials were supplied, and the caller's
-        existing error path keeps the finding at its original severity.
+        A resolver failure returns ``None`` and the adjudicator sends nothing
+        (see :meth:`_call_llm`). Sending anyway would ship the scanned file to
+        whatever LiteLLM resolves from ambient environment variables -- the
+        provider's public endpoint rather than the configured gateway, or a
+        remote Ollama host the loopback guard just rejected. Findings keep
+        their original severity, so the scan verdict is unaffected.
         """
         try:
             return ProviderConfig(
@@ -395,13 +398,15 @@ class Adjudicator:
             )
         except Exception as exc:
             logger.debug("adjudicator could not resolve provider config: %s", exc)
+            self._provider_config_error = f"{type(exc).__name__}: {exc}"
             return None
 
-    def _provider_params(self) -> dict[str, Any]:
+    def _provider_params(self) -> dict[str, Any] | None:
         """Request parameters carrying the resolved credentials and routing.
 
-        Empty when resolution was unavailable, so the request is unchanged from
-        a credential-less one and the caller's error path handles the outcome.
+        ``None`` when resolution is unavailable, which the caller treats as
+        "do not send". An empty dict is a valid result, not a failure: Vertex
+        ADC and Bedrock IAM authenticate ambiently and may need no parameters.
 
         Side effect, inherited from the shared resolver: for Google AI Studio
         models ``get_request_params`` sets ``GEMINI_API_KEY`` in the process
@@ -410,12 +415,13 @@ class Adjudicator:
         """
         config = self._provider_config
         if config is None:
-            return {}
+            return None
         try:
             params = dict(config.get_request_params())
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("adjudicator could not build provider request params: %s", exc)
-            return {}
+            self._provider_config_error = f"{type(exc).__name__}: {exc}"
+            return None
 
         # Adopt the normalised model where ProviderConfig rewrites it onto
         # LiteLLM's OpenAI adapter: OpenAI-compatible gateways (a bare custom
@@ -469,6 +475,11 @@ class Adjudicator:
         # the one value the resolver may legitimately override (OpenAI-compatible
         # prefixing), so it is taken explicitly instead of being clobbered.
         provider_params = self._provider_params()
+        if provider_params is None:
+            # Fail closed: without resolved routing, LiteLLM would send the
+            # scanned content wherever ambient environment variables point.
+            self._note_llm_failure(f"provider configuration unavailable: {self._provider_config_error or 'unknown'}")
+            return None
         model = provider_params.pop("model", None) or self.model
         request: dict[str, Any] = {
             **provider_params,

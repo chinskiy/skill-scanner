@@ -601,23 +601,33 @@ class TestAdjudicatorProviderCredentials:
         assert kwargs["max_tokens"] == 200
         assert len(kwargs["messages"]) == 2
 
-    def test_provider_resolution_failure_still_calls_llm(self, tmp_path: Path, with_model_env: None) -> None:
+    def test_provider_resolution_failure_sends_nothing(
+        self, tmp_path: Path, with_model_env: None, caplog: pytest.LogCaptureFixture
+    ) -> None:
         skill = _make_skill(tmp_path, "---\nname: test\n---\n\nSome content.\n")
         finding = _finding("PROMPT_INJECTION_CONCEALMENT", Severity.HIGH, line_number=4)
 
-        with patch("litellm.completion") as mock_call:
-            mock_call.return_value = _mock_litellm_response("real", 5)
-            with patch(
-                "skill_scanner.core.analyzers.llm_provider_config.ProviderConfig.__init__",
-                side_effect=ImportError("provider SDK missing"),
-            ):
-                Adjudicator().adjudicate([finding], skill)
+        with caplog.at_level(logging.WARNING):
+            with patch("litellm.completion") as mock_call:
+                mock_call.return_value = _mock_litellm_response("real", 5)
+                with patch(
+                    "skill_scanner.core.analyzers.llm_provider_config.ProviderConfig.__init__",
+                    side_effect=ImportError("provider SDK missing"),
+                ):
+                    Adjudicator().adjudicate([finding], skill)
 
-        # A resolver failure must not be louder than the credential it supplies:
-        # the request still goes out, and the existing error path keeps the
-        # finding at its original severity if it fails.
-        assert mock_call.call_count == 1
+        # Fail closed. Sending anyway would ship the scanned file to whatever
+        # LiteLLM resolves from ambient env vars -- the provider's public endpoint
+        # instead of the configured gateway, or a remote Ollama host the loopback
+        # guard just rejected. The finding keeps its severity and the operator
+        # gets one WARNING naming the cause.
+        assert mock_call.call_count == 0
         assert finding.severity == Severity.HIGH
+        warnings = [
+            r for r in caplog.records if r.levelno == logging.WARNING and r.name.endswith("analyzers.adjudicator")
+        ]
+        assert len(warnings) == 1
+        assert "provider SDK missing" in warnings[0].getMessage()
 
     def test_first_llm_failure_is_reported_at_warning_once(
         self, tmp_path: Path, with_model_env: None, caplog: pytest.LogCaptureFixture
