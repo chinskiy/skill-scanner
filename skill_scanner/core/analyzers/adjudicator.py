@@ -276,20 +276,7 @@ class Adjudicator:
         model = _resolve_model()
         if model is None and self.provider == "orcarouter":
             model = "orcarouter/anthropic/claude-sonnet-5"
-
-        self.provider_config: ProviderConfig | None = None
-        self.model: str | None
-        if model and (self.provider == "orcarouter" or model.lower().startswith("orcarouter/")):
-            self.provider_config = ProviderConfig(
-                model=model,
-                api_key=os.environ.get("SKILL_SCANNER_LLM_API_KEY"),
-                base_url=os.environ.get("SKILL_SCANNER_LLM_BASE_URL"),
-                api_version=os.environ.get("SKILL_SCANNER_LLM_API_VERSION"),
-                provider=self.provider,
-            )
-            self.model = self.provider_config.model
-        else:
-            self.model = model
+        self.model: str | None = model
         self.temperature = _resolve_temperature()
 
         # Lazy-loaded rule registry — only touched if we actually
@@ -297,9 +284,12 @@ class Adjudicator:
         # policy level costs nothing on skills with no HIGH+ findings.
         self._rule_registry: Any = None
 
-        # Lazy-loaded provider config, for the same reason. ``False`` marks a
-        # resolution failure so it is attempted once, not per finding.
-        self._provider_config: Any = None
+        # Credentials and routing are resolved once, here, from the same
+        # environment the LLM analyzer reads at its own construction -- not
+        # per finding, when the environment may no longer be the one the
+        # operator configured. ``None`` means unavailable (no model, or the
+        # resolver failed); the request then goes out without them.
+        self._provider_config: ProviderConfig | None = self._build_provider_config(model) if model else None
 
         # Latch so a broken LLM path is reported once per scan, not per finding.
         self._llm_failure_reported = False
@@ -375,14 +365,13 @@ class Adjudicator:
             detail,
         )
 
-    def _provider_params(self) -> dict[str, Any]:
-        """Resolve provider credentials and routing for the outbound request.
+    def _build_provider_config(self, model: str) -> ProviderConfig | None:
+        """Resolve provider credentials and routing through :class:`ProviderConfig`.
 
-        Delegates to :class:`ProviderConfig` -- the same resolver
-        ``LLMRequestHandler`` uses -- so the adjudicator picks up every
-        provider mechanism it already implements (Azure Entra ID tokens,
-        Bedrock bearer/IAM, Vertex ADC, the Gemini ``GEMINI_API_KEY`` handoff)
-        rather than re-deriving any of it here.
+        This is the same resolver ``LLMRequestHandler`` uses, so the adjudicator
+        picks up every provider mechanism it already implements (Azure Entra ID
+        tokens, Bedrock bearer/IAM, Vertex ADC, the Gemini ``GEMINI_API_KEY``
+        handoff) rather than re-deriving any of it here.
 
         ``base_url`` and ``api_version`` are read here and passed IN, because
         ``ProviderConfig`` takes them as constructor arguments and never reads
@@ -395,53 +384,56 @@ class Adjudicator:
         lets the adjudicator run a different model, which may need a different
         endpoint.
 
-        The config is built once and cached. A resolver failure must not be
-        louder than the credential it is trying to supply, so any exception
-        degrades to an empty dict: the request then goes out exactly as it did
-        before this method existed, and the caller's existing error path keeps
-        the finding at its original severity.
+        A resolver failure must not be louder than the credential it is trying
+        to supply, so any exception degrades to ``None``: the request then goes
+        out exactly as it did before credentials were supplied, and the caller's
+        existing error path keeps the finding at its original severity.
+        """
+        try:
+            return ProviderConfig(
+                model=model,
+                base_url=(
+                    os.environ.get("SKILL_SCANNER_ADJUDICATOR_LLM_BASE_URL")
+                    or os.environ.get("SKILL_SCANNER_LLM_BASE_URL")
+                ),
+                api_version=(
+                    os.environ.get("SKILL_SCANNER_ADJUDICATOR_LLM_API_VERSION")
+                    or os.environ.get("SKILL_SCANNER_LLM_API_VERSION")
+                ),
+                provider=self.provider,
+            )
+        except Exception as exc:
+            logger.debug("adjudicator could not resolve provider config: %s", exc)
+            return None
+
+    def _provider_params(self) -> dict[str, Any]:
+        """Request parameters carrying the resolved credentials and routing.
+
+        Empty when resolution was unavailable, so the request is unchanged from
+        a credential-less one and the caller's error path handles the outcome.
 
         Side effect, inherited from the shared resolver: for Google AI Studio
         models ``get_request_params`` sets ``GEMINI_API_KEY`` in the process
         environment when it is unset. Same value, from the same variable, as
         the LLM analyzer would write.
         """
-        if self._provider_config is None:
-            try:
-                from .llm_provider_config import ProviderConfig
-
-                self._provider_config = ProviderConfig(
-                    # `or ""` satisfies the type checker only; _call_llm has
-                    # already returned when self.model is falsy.
-                    model=self.model or "",
-                    base_url=(
-                        os.environ.get("SKILL_SCANNER_ADJUDICATOR_LLM_BASE_URL")
-                        or os.environ.get("SKILL_SCANNER_LLM_BASE_URL")
-                    ),
-                    api_version=(
-                        os.environ.get("SKILL_SCANNER_ADJUDICATOR_LLM_API_VERSION")
-                        or os.environ.get("SKILL_SCANNER_LLM_API_VERSION")
-                    ),
-                )
-            except Exception as exc:
-                logger.debug("adjudicator could not resolve provider config: %s", exc)
-                self._provider_config = False
-
-        if self._provider_config is False:
+        config = self._provider_config
+        if config is None:
             return {}
         try:
-            params = dict(self._provider_config.get_request_params())
+            params = dict(config.get_request_params())
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("adjudicator could not build provider request params: %s", exc)
             return {}
 
-        # Adopt the normalised model ONLY for OpenAI-compatible providers, where
-        # ProviderConfig adds the `openai/` prefix LiteLLM requires to route at
-        # all -- a bare gateway model name raises "LLM Provider NOT provided".
-        # Deliberately not generalised: the Gemini normalisation targets the
-        # Google SDK, which this LiteLLM-only path cannot use.
-        if getattr(self._provider_config, "is_openai_compatible", False):
-            params["model"] = self._provider_config.model
+        # Adopt the normalised model where ProviderConfig rewrites it onto
+        # LiteLLM's OpenAI adapter: OpenAI-compatible gateways (a bare custom
+        # name raises "LLM Provider NOT provided") and OrcaRouter (LiteLLM does
+        # not recognise the `orcarouter/` prefix). Deliberately not generalised:
+        # the Gemini normalisation targets the Google SDK, which this
+        # LiteLLM-only path cannot use.
+        if config.is_openai_compatible or config.is_orcarouter:
+            params["model"] = config.model
 
         # ProviderConfig defaults aws_region to us-east-1, so this key is always
         # present for Bedrock. An explicit aws_region_name short-circuits
