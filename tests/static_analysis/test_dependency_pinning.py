@@ -272,7 +272,7 @@ class TestNpmDependencyPinning:
         findings = analyzer._check_dependency_pinning(skill)
         assert len(findings) == 1
         assert findings[0].rule_id == _RULE_ID
-        assert findings[0].severity == Severity.MEDIUM
+        assert findings[0].severity == Severity.LOW
         assert findings[0].file_path == "package.json"
         assert "lodash" in findings[0].description
 
