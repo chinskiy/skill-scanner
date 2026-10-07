@@ -19,7 +19,8 @@ from skill_scanner.core.rule_registry import PackLoader, RuleDefinition
 from skill_scanner.core.rules.patterns import RuleLoader
 
 _PACKS = Path(__file__).resolve().parents[1] / "skill_scanner" / "data" / "packs"
-_COMMUNITY_BEHAVIOR_DIGEST = "f83d8fce9d7ad23d24f36020bf4f381fba810c8a544b9f06ab075a3bf2b6f39e"
+# Covers the PG_EXFIL_URL_ENCODING pattern change; no other rule differs.
+_COMMUNITY_BEHAVIOR_DIGEST = "f6c17ecfd77b35376429905cff795aea6e4f4074df1b3f0636e4651e1e942380"
 
 
 def _minimal_manifest() -> dict:
